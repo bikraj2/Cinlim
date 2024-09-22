@@ -1,0 +1,165 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"cinlim.bikraj.net/internal/validator"
+	"github.com/julienschmidt/httprouter"
+)
+
+// An envelope Content-Type
+type envelope map[string]interface{}
+
+func (app *application) readIDParam(r *http.Request) (int64, error) {
+
+	params := httprouter.ParamsFromContext(r.Context())
+
+	id, err := strconv.ParseInt(params.ByName("id"), 10, 64)
+
+	//TODO
+	if err != nil {
+		return 0, errors.New("invalid Id parameter")
+	}
+
+	return id, nil
+}
+
+func (app *application) writeJSON(w http.ResponseWriter, status int, data interface{}, headers http.Header) error {
+	js, err := json.Marshal(data)
+
+	if err != nil {
+		return err
+	}
+	for key, value := range headers {
+		w.Header()[key] = value
+
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(js)
+	return nil
+}
+
+func (app *application) readJSON(w http.ResponseWriter, r *http.Request, input interface{}) error {
+	// Use http.MaxBytesReader()
+
+	maxBytes := 1_048_576
+	// Read only the first 1 MB
+	r.Body = http.MaxBytesReader(w, r.Body, int64(maxBytes))
+
+	// DisallowUnknownFields
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	err := dec.Decode(&input)
+	if err != nil {
+		var syntaxError *json.SyntaxError
+		var unmarshalTypeError *json.UnmarshalTypeError
+		var invalidUnmarshalError *json.InvalidUnmarshalError
+		switch {
+		case errors.As(err, &syntaxError):
+			return fmt.Errorf("body Contains badly-formatted Json Value at %d", syntaxError.Offset)
+
+		case errors.Is(err, io.ErrUnexpectedEOF):
+			return errors.New("body Contains badly formated JSON")
+
+		case errors.As(err, &unmarshalTypeError):
+			if unmarshalTypeError.Field != "" {
+				return fmt.Errorf("the Json has unsupported JSON Type for field %q", unmarshalTypeError.Field)
+			}
+			return fmt.Errorf("body containes incorrect JSON type at %d", unmarshalTypeError.Offset)
+
+		case errors.Is(err, io.EOF):
+			return errors.New("body cannot be empty")
+
+		case strings.HasPrefix(err.Error(), "json: unknown field"):
+			fieldName := strings.TrimPrefix(err.Error(), "json: unknown field")
+			return fmt.Errorf("body contains unknown key %s", fieldName)
+
+		case err.Error() == "http: request body too large":
+			return fmt.Errorf("body must not  be larger than %d bytes", maxBytes)
+
+		case errors.As(err, &invalidUnmarshalError):
+			panic(err)
+
+		default:
+			return err
+		}
+	}
+
+	err = dec.Decode(&input)
+	if err != io.EOF {
+		return errors.New("body must contain only a single JSON value")
+	}
+	return nil
+}
+
+func (app *application) movieExists(id int64) (bool, error) {
+	query :=
+		`
+  SELECT FROM movies 
+  WHERE id = $1
+  `
+	result, err := app.models.Movies.DB.Exec(query, id)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rowsAffected == 0 {
+		return false, nil
+	} else {
+		return true, nil
+	}
+}
+func (app *application) readString(qs url.Values, key string, defaultValue string) string {
+	s := qs.Get(key)
+	if s == "" {
+		return defaultValue
+	}
+	return s
+}
+func (app *application) readCsv(qs url.Values, key string, defaultValue []string) []string {
+	csv := qs.Get(key)
+	if csv == "" {
+		return defaultValue
+	}
+	return strings.Split(csv, ",")
+}
+func (app *application) readInt(qs url.Values, key string, defaultValue int, v *validator.Validator) int {
+	s := qs.Get(key)
+	if s == "" {
+		return defaultValue
+	}
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		v.AddError(key, "must be an integer value")
+		return defaultValue
+	}
+	return i
+}
+func (app *application) background(fn func()) {
+
+	app.wg.Add(1)
+	go func() {
+
+		// Add to the wait group to wait for this instance of background task to complete
+		defer func() {
+
+			defer app.wg.Done()
+			if err := recover(); err != nil {
+				app.logger.PrintError(fmt.Errorf("error : %s", err), nil)
+			}
+		}()
+		fn()
+	}()
+}

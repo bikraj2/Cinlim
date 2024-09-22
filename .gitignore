@@ -1,0 +1,6 @@
+.env
+.envrc
+/remote
+./remote/production/api.service
+
+
